@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# video files stay local, they are too big for GitHub
+*.mp4
+
+# keep the example results (outputs/*.csv, *.png) but not the flow cache or temp files
+outputs/flow_cache/
+outputs/_*
