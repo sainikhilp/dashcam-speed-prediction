@@ -36,6 +36,8 @@ MATCH_MARGIN = 0.03       # best digit must beat the runner-up by this much
 VOTES_PER_SEC = 5         # GPS speed updates at 1 Hz, so several frames within
                           # the same second must agree -> majority vote
 MAX_JUMP_KMH = 25         # per-second change beyond this is treated as an OCR miss
+MAX_CHAR_GAP = 20         # px; real inter-digit gaps are <=14, glare blobs sit further
+DIGIT_W = (10, 30)        # px; plausible digit widths ('1' is ~12, others ~20)
 
 
 def start_time_from_name(video_path):
@@ -205,6 +207,44 @@ def learn_digit_templates(cap, start_time, n_seconds, samples_per_digit=6):
     return templates
 
 
+def save_templates(path, templates):
+    """Cache learned templates so short clips can reuse them (atomic write)."""
+    tmp = path + ".tmp.npz"
+    np.savez(tmp, **{f"g{d}": t[0] for d, t in templates.items()},
+             **{f"b{d}": t[1] for d, t in templates.items()})
+    os.replace(tmp, path)
+
+
+def load_templates(path):
+    z = np.load(path)
+    return {str(d): (z[f"g{d}"], z[f"b{d}"]) for d in range(10)}
+
+
+def verify_templates(cap, templates, start_time, n_seconds, min_acc=0.9):
+    """Check cached templates against this clip's KNOWN date digits."""
+    const = start_time.strftime("%Y-%m-%d")
+    digit_pos = [i for i, ch in enumerate(const) if ch.isdigit()]
+    total = correct = 0
+    for sec in range(min(n_seconds, 10)):
+        frame = _grab(cap, sec + 0.5)
+        if frame is None:
+            continue
+        band = frame[TEXT_Y[0]:TEXT_Y[1], TS_X[0]:TS_X[1]]
+        gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+        binimg = _binary(band)
+        boxes = _char_boxes(binimg)
+        if len(boxes) != 18:
+            continue
+        for i in digit_pos:
+            crop = _norm_crop(gray, binimg, *boxes[i])
+            if crop is None:
+                continue
+            best = max(templates, key=lambda d: _score(crop, templates[d]))
+            total += 1
+            correct += best == const[i]
+    return total >= 8 and correct / total >= min_acc
+
+
 def read_speed_once(frame, templates):
     """Read the speed digits from ONE frame. Returns int km/h or None.
 
@@ -216,8 +256,18 @@ def read_speed_once(frame, templates):
     gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
     binimg = _binary(band)
     boxes = _char_boxes(binimg)
+    # keep only the right-aligned digit group: bright scenery bleeding through
+    # the overlay can leave blobs LEFT of the digits, separated by a wide gap
+    kept = []
+    for box in reversed(boxes):
+        if kept and kept[-1][0] - box[1] > MAX_CHAR_GAP:
+            break
+        kept.append(box)
+    boxes = kept[::-1]
     if not boxes or len(boxes) > 3:      # speed is always 1-3 digits
         return None
+    if any(not (DIGIT_W[0] <= x1 - x0 <= DIGIT_W[1]) for x0, x1 in boxes):
+        return None                      # a blob that size is not a digit
     digits = ""
     for x0, x1 in boxes:
         crop = _norm_crop(gray, binimg, x0, x1)
@@ -281,6 +331,10 @@ def main():
                    help="Recording start 'YYYY-MM-DD HH:MM:SS' (default: parsed from filename).")
     p.add_argument("--debug", action="store_true",
                    help="Also save every speed-field crop, named with its reading.")
+    p.add_argument("--template-cache", default=None,
+                   help="Path to a .npz digit-template cache. Written after a "
+                        "successful learn; used as a verified fallback when a clip "
+                        "is too short to learn all ten digits itself.")
     args = p.parse_args()
 
     if not os.path.isfile(args.video):
@@ -305,7 +359,21 @@ def main():
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     n_seconds = max(1, int(np.floor(n_frames / fps)))
     print(f"[1/3] Learning digit templates from the timestamp ({name}, start {start_time})")
-    templates = learn_digit_templates(cap, start_time, n_seconds)
+    # Prefer verified cached templates: they come from a full 0-9 clock cycle on
+    # a long clip, whereas a short clip can mislabel digits it never saw and
+    # still read the speed field "confidently" (but wrong).
+    templates = None
+    if args.template_cache and os.path.isfile(args.template_cache):
+        cached = load_templates(args.template_cache)
+        if verify_templates(cap, cached, start_time, n_seconds):
+            print("      using cached digit templates (verified on this clip)")
+            templates = cached
+        else:
+            print("      cached templates failed verification; learning fresh")
+    if templates is None:
+        templates = learn_digit_templates(cap, start_time, n_seconds)
+        if args.template_cache and not os.path.isfile(args.template_cache):
+            save_templates(args.template_cache, templates)
 
     print(f"[2/3] Reading the speed field ({n_seconds} s, "
           f"{VOTES_PER_SEC}-frame majority vote per second)")

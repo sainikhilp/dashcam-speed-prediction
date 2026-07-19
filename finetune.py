@@ -36,7 +36,9 @@ labels aligned.
 """
 
 import argparse
+import glob
 import os
+import time
 
 import cv2
 import numpy as np
@@ -47,8 +49,14 @@ from model import Model
 from pipeline import _flow_image, _to_tensor, COMMA_SIZE, MODEL_INPUT
 
 
-def build_flow_cache(video_path, gt, cache_dir):
-    """Compute a 128x128 flow image per consecutive frame pair; return (paths, labels).
+def build_flow_cache(video_path, gt, cache_dir, stride=1):
+    """Compute a 128x128 flow image per used frame pair; return (paths, labels).
+
+    With stride > 1 only every stride-th frame is used, so the flow magnitude
+    matches a lower effective frame rate (e.g. a 60 fps dashcam with stride 3
+    gives 20 fps flow - the conditions the pretrained weights and
+    predict_speed.py's default resampling expect). Labels stay aligned because
+    they are indexed by ORIGINAL frame number.
 
     Writes into its own `cache_dir` (one per video) so frames from different
     videos never overwrite each other by index.
@@ -60,11 +68,14 @@ def build_flow_cache(video_path, gt, cache_dir):
         raise SystemExit(f"Could not read: {video_path}")
     prev = cv2.resize(prev, COMMA_SIZE, interpolation=cv2.INTER_AREA)
     paths, labels = [], []
-    i = 1
+    i = 0
     while True:
         ok, curr = cap.read()
         if not ok:
             break
+        i += 1
+        if i % stride:
+            continue
         curr = cv2.resize(curr, COMMA_SIZE, interpolation=cv2.INTER_AREA)
         flow = _flow_image(curr, prev)
         flow = cv2.resize(flow, MODEL_INPUT, interpolation=cv2.INTER_AREA)
@@ -73,7 +84,6 @@ def build_flow_cache(video_path, gt, cache_dir):
         paths.append(path)
         labels.append(float(gt[i]) if i < len(gt) else float(gt[-1]))
         prev = curr
-        i += 1
     cap.release()
     return paths, labels
 
@@ -119,6 +129,9 @@ def main():
     p.add_argument("--val", type=float, default=0.2, help="Validation fraction.")
     p.add_argument("--out", default="weights/finetuned.pt")
     p.add_argument("--cache", default="outputs/flow_cache")
+    p.add_argument("--stride", type=int, default=1,
+                   help="Use every Nth frame (3 for a 60 fps camera -> 20 fps flow, "
+                        "matching the pretrained weights and predict_speed.py).")
     args = p.parse_args()
 
     # Resolve the list of (video, labels) pairs from either source.
@@ -147,9 +160,19 @@ def main():
             raise SystemExit(f"Labels not found: {gt_path}")
         gt = np.loadtxt(gt_path).ravel()
         cache_dir = os.path.join(args.cache, f"vid{vi:03d}")
-        print(f"[{vi + 1}/{len(pairs)}] Building optical-flow cache from {video_path} ...")
-        vpaths, vlabels = build_flow_cache(video_path, gt, cache_dir)
-        print(f"      {len(vpaths)} flow frames cached.")
+        cached = sorted(glob.glob(os.path.join(cache_dir, "*.png")),
+                        key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
+        if cached:   # reuse a cache from a previous run (delete the dir to rebuild)
+            idxs = [int(os.path.splitext(os.path.basename(c))[0]) for c in cached]
+            vpaths = cached
+            vlabels = [float(gt[i]) if i < len(gt) else float(gt[-1]) for i in idxs]
+            print(f"[{vi + 1}/{len(pairs)}] Reusing {len(cached)} cached flow frames "
+                  f"for {video_path}", flush=True)
+        else:
+            print(f"[{vi + 1}/{len(pairs)}] Building optical-flow cache from {video_path} ...",
+                  flush=True)
+            vpaths, vlabels = build_flow_cache(video_path, gt, cache_dir, args.stride)
+            print(f"      {len(vpaths)} flow frames cached.", flush=True)
         paths.extend(vpaths)
         labels.extend(vlabels)
 
@@ -170,36 +193,56 @@ def main():
     loss_fn = nn.MSELoss()
 
     def load_batch(indices):
-        xs = [_to_tensor(cv2.imread(paths[j])) for j in indices]
-        ys = torch.tensor([[labels[j]] for j in indices], dtype=torch.float32)
-        return torch.cat(xs).to(device), ys.to(device)
+        xs, ys = [], []
+        for j in indices:
+            img = cv2.imread(paths[j])
+            for _ in range(3):           # transient read failures (AV file locks)
+                if img is not None:
+                    break
+                time.sleep(0.2)
+                img = cv2.imread(paths[j])
+            if img is None:
+                print(f"  warning: skipping unreadable cache file {paths[j]}", flush=True)
+                continue
+            xs.append(_to_tensor(img))
+            ys.append([labels[j]])
+        if not xs:
+            return None, None
+        return (torch.cat(xs).to(device),
+                torch.tensor(ys, dtype=torch.float32).to(device))
 
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
     for ep in range(1, args.epochs + 1):
         net.train()
         np.random.shuffle(train_idx)
-        tot = 0.0
+        tot, n_tot = 0.0, 0
         for b in range(0, len(train_idx), args.batch):
-            bi = train_idx[b:b + args.batch]
-            x, y = load_batch(bi)
+            x, y = load_batch(train_idx[b:b + args.batch])
+            if x is None:
+                continue
             opt.zero_grad()
             loss = loss_fn(net(x), y)
             loss.backward()
             opt.step()
-            tot += loss.item() * len(bi)
+            tot += loss.item() * y.shape[0]
+            n_tot += y.shape[0]
         # validation
         net.eval()
         with torch.no_grad():
             vi = np.array(sorted(val_idx))
-            vloss = 0.0
-            if len(vi):
-                for b in range(0, len(vi), args.batch):
-                    x, y = load_batch(vi[b:b + args.batch])
-                    vloss += loss_fn(net(x), y).item() * len(vi[b:b + args.batch])
-                vloss /= len(vi)
-        print(f"  epoch {ep:2d}/{args.epochs}  train_mse={tot/len(train_idx):6.3f}  val_mse={vloss:6.3f}")
+            vloss, n_val_used = 0.0, 0
+            for b in range(0, len(vi), args.batch):
+                x, y = load_batch(vi[b:b + args.batch])
+                if x is None:
+                    continue
+                vloss += loss_fn(net(x), y).item() * y.shape[0]
+                n_val_used += y.shape[0]
+            vloss = vloss / n_val_used if n_val_used else float("nan")
+        # checkpoint every epoch so a crash never loses the training done so far
+        torch.save(net.state_dict(), args.out)
+        print(f"  epoch {ep:2d}/{args.epochs}  train_mse={tot/max(n_tot,1):6.3f}  "
+              f"val_mse={vloss:6.3f}  (saved -> {args.out})", flush=True)
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    torch.save(net.state_dict(), args.out)
     print(f"\nSaved fine-tuned weights -> {args.out}")
 
 
