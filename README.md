@@ -151,7 +151,7 @@ prints MAE / MSE per clip and overall.
 | `eval_split.py` | score weights against the GPS truth per split |
 | `compare_gt.py` | older per-clip GT comparison (interval tables) |
 | `weights/Model.pt` | pretrained weights (comma.ai data) |
-| `weights/finetuned.pt` | fine-tuned on our 70mai data — **use this one** |
+| `weights/finetuned.pt` | fine-tuned on our 70mai data **use this one** |
 
 ## Notes and limits
 
